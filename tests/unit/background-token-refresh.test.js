@@ -55,7 +55,7 @@ describe("selectConnectionsNeedingRefresh", () => {
     expect(list).toHaveLength(0);
   });
 
-  it("never selects apikey connections", async () => {
+  it("never selects api-key or imported access-token connections", async () => {
     const { selectConnectionsNeedingRefresh } = await import(
       "../../src/sse/services/backgroundTokenRefresh.js"
     );
@@ -63,6 +63,7 @@ describe("selectConnectionsNeedingRefresh", () => {
       [
         conn({ authType: "apikey", refreshToken: "rt" }),
         conn({ id: "c2", authType: "api_key", refreshToken: "rt" }),
+        conn({ id: "c3", authType: "access_token", refreshToken: "rt" }),
       ],
       NOW
     );
