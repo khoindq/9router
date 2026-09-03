@@ -10,7 +10,10 @@ import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 const PROXY_OAUTH_PROVIDERS = new Set(["trae", "windsurf", "zed"]);
 
 // Providers offering a paste-token fallback (import-token flow).
-// UX warns if the IDE (which issues the token) is not installed.
+// ideDetect: warn if the IDE that issues the token is not installed locally
+// (/ide-status only supports trae/windsurf).
+// endpoint/bodyKey: where the pasted token is submitted — defaults to the generic
+// /exchange route with { code }.
 const PASTE_TOKEN_PROVIDERS = {
   trae: {
     label: "Cloud-IDE-JWT",
@@ -18,6 +21,7 @@ const PASTE_TOKEN_PROVIDERS = {
       "Sign in at trae.ai (or solo.trae.ai), open DevTools → Network, copy the Cloud-IDE-JWT token from any request's Authorization header (~14-day lifetime).",
     placeholder: "Paste Cloud-IDE-JWT here...",
     ideName: "Trae",
+    ideDetect: true,
     ideOptional: true, // token can be grabbed from DevTools without the IDE
   },
   windsurf: {
@@ -26,7 +30,17 @@ const PASTE_TOKEN_PROVIDERS = {
       "In the Windsurf/VS Code IDE, run the \"Windsurf: Provide Auth Token\" command, then copy the displayed sk-ws-... key.",
     placeholder: "Paste sk-ws-... key here...",
     ideName: "Windsurf",
+    ideDetect: true,
     ideOptional: false,
+  },
+  claude: {
+    label: "Claude OAuth token",
+    instructions:
+      "Sign in with Claude Code, then copy claudeAiOauth.accessToken from ~/.claude/.credentials.json (macOS: Keychain item \"Claude Code-credentials\"). It starts with sk-ant-oat. Access token only — there is no refresh, so re-paste it when it expires.",
+    placeholder: "Paste sk-ant-oat... token here...",
+    endpoint: "/api/oauth/claude/import-token",
+    bodyKey: "accessToken",
+    masked: true,
   },
 };
 
@@ -43,7 +57,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
   const [isDeviceCode, setIsDeviceCode] = useState(false);
   const [deviceData, setDeviceData] = useState(null);
   const [polling, setPolling] = useState(false);
-  // trae/windsurf: choose between browser OAuth (proxy) and paste-token (import)
+  // OAuth providers can choose between browser OAuth and paste-token import.
   const [authMode, setAuthMode] = useState("browser"); // "browser" | "paste-token"
   const [pasteToken, setPasteToken] = useState("");
   const [ideStatus, setIdeStatus] = useState(null);
@@ -415,7 +429,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       setIdeStatus(null);
       pollingAbortRef.current = false;
       // Best-effort IDE detection for paste-token providers (Trae/Windsurf)
-      if (PASTE_TOKEN_PROVIDERS[provider]) {
+      if (PASTE_TOKEN_PROVIDERS[provider]?.ideDetect) {
         fetch(`/api/oauth/${provider}/ide-status`)
           .then((r) => r.json())
           .then((data) => setIdeStatus(data))
@@ -577,17 +591,20 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     try {
       setError(null);
 
-      // Paste-token mode (Trae/Windsurf): token goes straight to /exchange
-      if (authMode === "paste-token" && PASTE_TOKEN_PROVIDERS[provider]) {
+      // Paste-token mode: token goes straight to the provider's import endpoint
+      // (Trae/Windsurf reuse /exchange; Claude has a dedicated import-token route).
+      const pasteConfig = PASTE_TOKEN_PROVIDERS[provider];
+      if (authMode === "paste-token" && pasteConfig) {
         const token = pasteToken.trim();
         if (!token) throw new Error("Missing token");
-        const res = await fetch(`/api/oauth/${provider}/exchange`, {
+        const res = await fetch(pasteConfig.endpoint || `/api/oauth/${provider}/exchange`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code: token }),
+          body: JSON.stringify({ [pasteConfig.bodyKey || "code"]: token }),
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error);
+        setPasteToken("");
         setStep("success");
         onSuccess?.();
         return;
@@ -669,6 +686,9 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
   }, [onClose, provider]);
 
   if (!provider || !providerInfo) return null;
+  const isProxyProvider = PROXY_OAUTH_PROVIDERS.has(provider);
+  const pasteTokenConfig = PASTE_TOKEN_PROVIDERS[provider];
+  const showAuthModeToggle = !!pasteTokenConfig;
   const isXaiProvider = provider === "xai";
   const isKimchiProvider = provider === "kimchi";
   const deviceLoginUrl = deviceData?.verification_uri_complete || deviceData?.verification_uri || "";
@@ -682,8 +702,8 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
   return (
     <Modal isOpen={isOpen} title={modalTitle} onClose={handleClose} size="lg">
       <div className="flex flex-col gap-4">
-        {/* Trae/Windsurf: browser OAuth (proxy) + paste-token fallback */}
-        {PROXY_OAUTH_PROVIDERS.has(provider) && (step === "waiting" || step === "input" || step === "error") && (
+        {/* Providers that support both browser OAuth and paste-token import. */}
+        {showAuthModeToggle && (step === "waiting" || step === "input" || step === "error") && (
           <>
             <div className="flex gap-2">
               <button
@@ -702,7 +722,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
               </button>
             </div>
 
-            {authMode === "browser" && (
+            {isProxyProvider && authMode === "browser" && (
               <>
                 {step === "waiting" && (
                   <div className="flex items-center gap-2 px-3 py-2 border border-border rounded-lg bg-sidebar/50">
@@ -730,21 +750,22 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
               </>
             )}
 
-            {authMode === "paste-token" && (
+            {authMode === "paste-token" && pasteTokenConfig && (
               <div className="space-y-3">
                 {ideStatus && !ideStatus.installed && (
-                  <div className={`px-3 py-2 rounded-lg text-sm ${PASTE_TOKEN_PROVIDERS[provider].ideOptional ? "bg-blue-500/10 text-blue-700 dark:text-blue-300" : "bg-yellow-500/10 text-yellow-700 dark:text-yellow-300"}`}>
-                    {PASTE_TOKEN_PROVIDERS[provider].ideName} IDE not detected.
-                    {PASTE_TOKEN_PROVIDERS[provider].ideOptional
+                  <div className={`px-3 py-2 rounded-lg text-sm ${pasteTokenConfig.ideOptional ? "bg-blue-500/10 text-blue-700 dark:text-blue-300" : "bg-yellow-500/10 text-yellow-700 dark:text-yellow-300"}`}>
+                    {pasteTokenConfig.ideName} IDE not detected.
+                    {pasteTokenConfig.ideOptional
                       ? " You can still grab the token from DevTools."
-                      : ` Install ${PASTE_TOKEN_PROVIDERS[provider].ideName} IDE to get the token, or use "Sign in with browser".`}
+                      : ` Install ${pasteTokenConfig.ideName} IDE to get the token, or use "Sign in with browser".`}
                   </div>
                 )}
-                <p className="text-sm text-text-muted">{PASTE_TOKEN_PROVIDERS[provider].instructions}</p>
+                <p className="text-sm text-text-muted">{pasteTokenConfig.instructions}</p>
                 <Input
                   value={pasteToken}
                   onChange={(e) => setPasteToken(e.target.value)}
-                  placeholder={PASTE_TOKEN_PROVIDERS[provider].placeholder}
+                  placeholder={pasteTokenConfig.placeholder}
+                  type={pasteTokenConfig.masked ? "password" : "text"}
                   className="font-mono text-xs"
                 />
                 <div className="flex gap-2">
@@ -756,8 +777,8 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
           </>
         )}
 
-        {/* Waiting + Manual Input combined (non-device-code, non-proxy) */}
-        {(step === "waiting" || step === "input") && !isDeviceCode && !PROXY_OAUTH_PROVIDERS.has(provider) && (
+        {/* Generic browser OAuth UI. Hide it while paste-token mode is active. */}
+        {(step === "waiting" || step === "input") && !isDeviceCode && !isProxyProvider && authMode === "browser" && (
           <>
             {/* Option A: Auto via popup */}
             <div className="flex items-center gap-2 px-3 py-2 border border-border rounded-lg bg-sidebar/50">
@@ -897,7 +918,13 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
             <h3 className="text-lg font-semibold mb-2">Connection Failed</h3>
             <p className="text-sm text-red-600 mb-4">{error}</p>
             <div className="flex gap-2">
-              <Button onClick={startOAuthFlow} variant="secondary" fullWidth>
+              <Button
+                onClick={authMode === "paste-token"
+                  ? () => { setError(null); setStep("input"); }
+                  : startOAuthFlow}
+                variant="secondary"
+                fullWidth
+              >
                 Try Again
               </Button>
               <Button onClick={handleClose} variant="ghost" fullWidth>
